@@ -1,7 +1,6 @@
 # fundus_enhancement_app.py
-# Retinal fundus enhancement with image decomposition + visual adaptation
-# Based on: Wang, Li, Yang, "Retinal fundus image enhancement with image decomposition and visual adaptation"
-# Computers in Biology and Medicine 128 (2021) 104116
+# Retinal fundus enhancement with paper-style visualization
+# Pipeline: TV decomposition -> Visual adaptation (Naka–Rushton) -> Weighted fusion
 
 import io
 import math
@@ -9,7 +8,7 @@ from typing import Tuple
 
 # ---- Safe OpenCV import with helpful message ----
 try:
-    import cv2  # OpenCV
+    import cv2
 except ModuleNotFoundError:
     import streamlit as st
     st.error(
@@ -22,13 +21,15 @@ except ModuleNotFoundError:
 import numpy as np
 import streamlit as st
 from PIL import Image
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
 
 # ===========================
 # ====== UI CONFIG ==========
 # ===========================
-st.set_page_config(page_title="Retinal Fundus Enhancement", page_icon="🩺", layout="wide")
-st.title("🩺 Retinal Fundus Enhancement (Decomposition + Visual Adaptation)")
-st.caption("Upload a fundus image, or use the sample. Defaults match the paper; tune parameters as needed.")
+st.set_page_config(page_title="Retinal Fundus Enhancement — Paper-Style", page_icon="🩺", layout="wide")
+st.title("🩺 Retinal Fundus Enhancement — Paper-Style Visualization")
+st.caption("Upload a fundus image, or use the sample. Defaults match the paper; visuals explain each processing stage.")
 
 # ===========================
 # ====== UTILITIES ==========
@@ -59,15 +60,44 @@ def gaussian_from_sigma(sigma: float):
         k += 1
     return (k, k), sigma
 
+def imshow_heat(ax, img01, title="", cmap="magma", vmin=None, vmax=None):
+    ax.imshow(img01, cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.set_title(title, fontsize=11)
+    ax.axis("off")
+
+def imshow_rgb(ax, img01, title=""):
+    ax.imshow(np.clip(img01, 0, 1))
+    ax.set_title(title, fontsize=11)
+    ax.axis("off")
+
+def hist_plot(ax, data01, title="", bins=256):
+    ax.hist(data01.ravel(), bins=bins, range=(0, 1), alpha=0.9)
+    ax.set_xlim(0, 1)
+    ax.set_title(title, fontsize=11)
+    ax.set_xlabel("Intensity")
+    ax.set_ylabel("Frequency")
+
+def profile_line(img01_gray, r0, r1, c0, c1, num=512):
+    # Bresenham-like sampling for a straight line profile
+    ys = np.linspace(r0, r1, num)
+    xs = np.linspace(c0, c1, num)
+    coords = np.stack([ys, xs], axis=1)
+    H, W = img01_gray.shape[:2]
+    vals = []
+    for y, x in coords:
+        yi = int(np.clip(round(y), 0, H-1))
+        xi = int(np.clip(round(x), 0, W-1))
+        vals.append(img01_gray[yi, xi])
+    return np.array(vals), coords
+
 # ===========================
 # ====== SAMPLE IMAGE =======
 # ===========================
 def demo_fundus() -> np.ndarray:
-    """Synthetic green-channel dominant disc + vessel strokes, shape-safe."""
+    """Synthetic green-dominant disc + vessel strokes, shape-safe."""
     H, W = 640, 640
-    y, x = np.indices((H, W))                 # both (H, W)
+    y, x = np.indices((H, W))
     cx, cy, r = W // 2, H // 2, int(0.8 * H / 2)
-
     img = np.zeros((H, W, 3), np.float32)
 
     # Disc with smooth falloff in G
@@ -91,10 +121,6 @@ def demo_fundus() -> np.ndarray:
 # == Chambolle ROF TV (grayscale) ===
 # ==================================
 def tv_denoise_gray(u0: np.ndarray, weight: float, tau: float = 0.125, iters: int = 50) -> np.ndarray:
-    """
-    Fast ROF-TV denoising. u0 in [0,1]; returns 'base/structure'.
-    weight ~ lambda in ROF. Higher => stronger smoothing.
-    """
     u = u0.copy()
     px = np.zeros_like(u0)
     py = np.zeros_like(u0)
@@ -138,7 +164,7 @@ def lambda1_global_noise(img01: np.ndarray) -> Tuple[float, float, float]:
 # ==================================
 # === Visual adaptation (HSV.V) ====
 # ==================================
-def visual_adaptation_on_base(base_rgb01: np.ndarray, n: float = 1.0) -> np.ndarray:
+def visual_adaptation_on_base(base_rgb01: np.ndarray, n: float = 1.0):
     hsv = rgb_to_hsv(base_rgb01)
     V = to_float01(hsv[..., 2])
     Mg = float(np.mean(V))
@@ -146,20 +172,22 @@ def visual_adaptation_on_base(base_rgb01: np.ndarray, n: float = 1.0) -> np.ndar
     sigma_g = Mg / (1.0 + math.exp(Sg))  # paper's σ_g
     outV = (V ** n) / ((V ** n) + (sigma_g ** n + 1e-12))
     hsv[..., 2] = np.clip(outV * 255.0, 0, 255)
-    return hsv_to_rgb(hsv)
+    return hsv_to_rgb(hsv), V, outV, sigma_g
 
 # ==================================
 # ===== Weighted fusion (ω_c) ======
 # ==================================
-def fuse(enh_base_rgb01: np.ndarray, detail_rgb01: np.ndarray,
-         alpha_r: float, alpha_g: float, alpha_b: float, gauss_sigma: float) -> np.ndarray:
+def fuse_with_weights(enh_base_rgb01: np.ndarray, detail_rgb01: np.ndarray,
+                      alpha_r: float, alpha_g: float, alpha_b: float, gauss_sigma: float):
     mag = np.abs(detail_rgb01)
     (kx, ky), sig = gaussian_from_sigma(gauss_sigma)
     w = np.zeros_like(detail_rgb01)
-    for c, a in enumerate([alpha_r, alpha_g, alpha_b]):
+    alphas = [alpha_r, alpha_g, alpha_b]
+    for c, a in enumerate(alphas):
         blur = cv2.GaussianBlur(mag[..., c], (kx, ky), sig, borderType=cv2.BORDER_REFLECT)
         w[..., c] = a * blur
-    return np.clip(enh_base_rgb01 + w * detail_rgb01, 0.0, 1.0)
+    out = np.clip(enh_base_rgb01 + w * detail_rgb01, 0.0, 1.0)
+    return out, w
 
 # ==================================
 # ============== UI ================
@@ -207,13 +235,15 @@ else:
         st.warning("Please upload a retinal fundus image to continue.")
         st.stop()
 
-st.caption("Pipeline: (1) TV decomposition (noise vs structure using λ₁) → (2) TV (base vs detail with λ₂) → "
-           "(3) Naka–Rushton visual adaptation on luminance → (4) fuse enhanced base + weighted detail (discard noise).")
+st.caption(
+    "Pipeline: (1) TV decomposition (λ₁ noise→structure) → (2) TV (λ₂ base→detail) → "
+    "(3) Naka–Rushton visual adaptation on luminance → (4) fuse enhanced base + weighted detail (discard noise)."
+)
 
 # ==================================
 # ========== Processing =============
 # ==================================
-# STEP 1: noise vs structure using λ₁ (from global noise estimation)
+# STEP 1: noise vs structure using λ₁
 lam1_r, lam1_g, lam1_b = lambda1_global_noise(rgb01)
 structure, noise = tv_decompose_color(rgb01, (lam1_r, lam1_g, lam1_b), iters=iters)
 
@@ -221,41 +251,152 @@ structure, noise = tv_decompose_color(rgb01, (lam1_r, lam1_g, lam1_b), iters=ite
 base, detail = tv_decompose_color(structure, (lam2, lam2, lam2), iters=iters)
 
 # STEP 3: visual adaptation on base (HSV.V using Naka–Rushton)
-enh_base = visual_adaptation_on_base(base, n=n_naka)
+enh_base, V_before, V_after, sigma_g = visual_adaptation_on_base(base, n=n_naka)
 
-# STEP 4: fusion (discard noise layer)
-out = fuse(enh_base, detail, alpha_r, alpha_g, alpha_b, gauss_sigma)
+# STEP 4: fusion (discard noise layer) + keep weight maps
+out, weights = fuse_with_weights(enh_base, detail, alpha_r, alpha_g, alpha_b, gauss_sigma)
 
 # ==================================
-# ============ Display =============
+# ======== TABS (Paper-style) =======
 # ==================================
-c1, c2 = st.columns(2)
-with c1:
-    st.subheader("Original")
-    st.image(to_uint8(rgb01), channels="RGB", use_container_width=True)
-with c2:
-    st.subheader("Enhanced")
-    st.image(to_uint8(out), channels="RGB", use_container_width=True)
+tab_overview, tab_decomp, tab_adapt, tab_fuse, tab_profiles = st.tabs(
+    ["Overview", "Decomposition", "Visual Adaptation", "Fusion", "Line Profiles"]
+)
 
-st.divider()
-with st.expander("Show intermediate layers", expanded=False):
-    cA, cB, cC = st.columns(3)
-    with cA:
-        st.caption("Structure (after λ₁ TV)")
-        st.image(to_uint8(structure), channels="RGB", use_container_width=True)
-    with cB:
-        st.caption("Base (after λ₂ TV)")
-        st.image(to_uint8(base), channels="RGB", use_container_width=True)
-    with cC:
-        st.caption("Detail (visualized)")
-        st.image(to_uint8(np.clip(0.5 + detail, 0, 1)), channels="RGB", use_container_width=True)
+# ---------- OVERVIEW ----------
+with tab_overview:
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Original")
+        st.image(to_uint8(rgb01), channels="RGB", use_container_width=True)
+        fig, ax = plt.subplots(figsize=(5.2, 3.2))
+        hist_plot(ax, to_float01(cv2.cvtColor(to_uint8(rgb01), cv2.COLOR_RGB2HSV))[...,2]/255.0, "Histogram (Original luminance V)")
+        st.pyplot(fig, use_container_width=True)
+    with c2:
+        st.subheader("Enhanced")
+        st.image(to_uint8(out), channels="RGB", use_container_width=True)
+        fig, ax = plt.subplots(figsize=(5.2, 3.2))
+        hist_plot(ax, V_after, "Histogram (Enhanced luminance V)")
+        st.pyplot(fig, use_container_width=True)
+
+# ---------- DECOMPOSITION ----------
+with tab_decomp:
+    st.markdown("**Two-stage TV decomposition**: First remove noise (λ₁), then split base/detail (λ₂).")
+    fig, axes = plt.subplots(2, 3, figsize=(12, 7))
+    imshow_rgb(axes[0,0], rgb01, "Input RGB")
+    imshow_rgb(axes[0,1], structure, "Structure (after λ₁)")
+    # visualize noise magnitude
+    noise_mag = np.mean(np.abs(noise), axis=2)
+    imshow_heat(axes[0,2], noise_mag, "Noise magnitude ‖N‖", cmap="magma")
+
+    imshow_rgb(axes[1,0], base, "Base (after λ₂)")
+    # detail magnitude
+    detail_mag = np.mean(np.abs(detail), axis=2)
+    imshow_heat(axes[1,1], detail_mag, "Detail magnitude ‖D‖", cmap="magma")
+    imshow_rgb(axes[1,2], enh_base, "Enhanced base (after visual adaptation)")
+    plt.tight_layout()
+    st.pyplot(fig, use_container_width=True)
+
+# ---------- VISUAL ADAPTATION ----------
+with tab_adapt:
+    st.markdown("**Naka–Rushton adaptation** on luminance V of HSV: "
+                r"$V' = \frac{V^n}{V^n + \sigma_g^n}$ "
+                f"with **n={n_naka:.2f}** and **σ_g={sigma_g:.4f}**.")
+
+    # Plot the response curve
+    fig, ax = plt.subplots(figsize=(5.2, 3.5))
+    v = np.linspace(0, 1, 512)
+    resp = (v**n_naka) / (v**n_naka + (sigma_g**n_naka + 1e-12))
+    ax.plot(v, resp, lw=2)
+    ax.set_title("Naka–Rushton Response Curve")
+    ax.set_xlabel("Input luminance V")
+    ax.set_ylabel("Adapted luminance V'")
+    ax.grid(alpha=0.3)
+    st.pyplot(fig, use_container_width=True)
+
+    # Before/After luminance heatmaps and histograms
+    c1, c2 = st.columns(2)
+    with c1:
+        fig, ax = plt.subplots(figsize=(5.2, 5.2))
+        imshow_heat(ax, V_before, "Luminance V (before)", cmap="magma")
+        st.pyplot(fig, use_container_width=True)
+
+        fig, ax = plt.subplots(figsize=(5.2, 3.2))
+        hist_plot(ax, V_before, "Histogram V (before)")
+        st.pyplot(fig, use_container_width=True)
+
+    with c2:
+        fig, ax = plt.subplots(figsize=(5.2, 5.2))
+        imshow_heat(ax, V_after, "Luminance V' (after)", cmap="magma")
+        st.pyplot(fig, use_container_width=True)
+
+        fig, ax = plt.subplots(figsize=(5.2, 3.2))
+        hist_plot(ax, V_after, "Histogram V' (after)")
+        st.pyplot(fig, use_container_width=True)
+
+# ---------- FUSION ----------
+with tab_fuse:
+    st.markdown("**Weighted fusion**: "
+                r"$I_{out} = I_{enh\_base} + \omega_c \cdot D_c$, where "
+                r"$\omega_c = \alpha_c (|D_c| * \mathcal{N}_\sigma)$.")
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        fig, axes = plt.subplots(2, 3, figsize=(12, 7))
+        for c, name in enumerate(["R", "G", "B"]):
+            imshow_heat(axes[0,c], np.abs(detail[..., c]), f"|Detail| channel {name}", cmap="magma")
+        for c, name in enumerate(["R", "G", "B"]):
+            imshow_heat(axes[1,c], weights[..., c], f"Weight ω_{name}", cmap="viridis")
+        plt.tight_layout()
+        st.pyplot(fig, use_container_width=True)
+    with c2:
+        st.image(to_uint8(enh_base), caption="Enhanced Base (pre-fusion)", use_container_width=True)
+        st.image(to_uint8(out), caption="Final Output (post-fusion)", use_container_width=True)
+
+# ---------- LINE PROFILES ----------
+with tab_profiles:
+    st.markdown("**Contrast along a line**: compares grayscale profiles before/after to illustrate vessel enhancement.")
+    # Choose a central horizontal line across the optic region
+    H, W = rgb01.shape[:2]
+    r0 = r1 = H // 2
+    c0, c1 = W // 6, 5 * W // 6
+
+    # Use green channel (clinically informative) for profiles
+    g_before = rgb01[..., 1]
+    g_after  = out[..., 1]
+    prof_before, coords = profile_line(g_before, r0, r1, c0, c1, num=800)
+    prof_after, _ = profile_line(g_after,  r0, r1, c0, c1, num=800)
+
+    # Show the sampling line
+    fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+    ax[0].imshow(rgb01)
+    ax[0].plot([c0, c1], [r0, r1], lw=2)
+    ax[0].set_title("Sampling line on Original")
+    ax[0].axis("off")
+    ax[1].imshow(out)
+    ax[1].plot([c0, c1], [r0, r1], lw=2)
+    ax[1].set_title("Sampling line on Enhanced")
+    ax[1].axis("off")
+    plt.tight_layout()
+    st.pyplot(fig, use_container_width=True)
+
+    # Plot profiles
+    fig, ax = plt.subplots(figsize=(10, 3.8))
+    ax.plot(np.linspace(0, 1, prof_before.size), prof_before, label="Before", lw=1.8)
+    ax.plot(np.linspace(0, 1, prof_after.size),  prof_after,  label="After", lw=1.8)
+    ax.set_title("Intensity Profile Along the Line (G channel)")
+    ax.set_xlabel("Normalized distance")
+    ax.set_ylabel("Intensity")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    st.pyplot(fig, use_container_width=True)
 
 # ==================================
 # =========== Download =============
 # ==================================
 buf = io.BytesIO()
 Image.fromarray(to_uint8(out)).save(buf, format="PNG")
-st.download_button("⬇️ Download enhanced PNG", data=buf.getvalue(), file_name="fundus_enhanced.png", mime="image/png")
+st.download_button("⬇️ Download enhanced PNG", data=buf.getvalue(),
+                   file_name="fundus_enhanced.png", mime="image/png")
 
 # ==================================
 # ======= Deployment notes =========
